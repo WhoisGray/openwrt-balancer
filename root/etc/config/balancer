@@ -1,0 +1,9 @@
+# Balancer keeps its own sources here. Wi-Fi passwords live in this file,
+# so the install script and uci-defaults force mode 600.
+
+config globals 'globals'
+	option enabled '0'
+	option base_wan 'wan'
+
+config state 'state'
+	option applied '0'

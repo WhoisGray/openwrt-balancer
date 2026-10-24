@@ -1,0 +1,1835 @@
+#!/bin/sh
+# SPDX-License-Identifier: Apache-2.0
+#
+# balancerctl — multi-WAN helper for luci-app-balancer.
+#
+# While Balancer is applied it owns one thing in mwan3: the member list of the
+# "balanced" policy. Stock rules that already point at that policy (https and
+# the default rules on a normal install) follow the weights. Reset writes the
+# original member list back and deletes only objects this tool created
+# (uci option balancer '1'). Stock wan/lan sections are never deleted.
+#
+# Load balance needs every active member on the same metric with different
+# weights. Different metrics would be failover, which is not this app.
+#
+# Passwords are stored in /etc/config/balancer (mode 600) and copied to
+# wireless when a Wi-Fi source is applied. They are never written to the log
+# or to status JSON.
+
+set -e
+
+VERSION="1.0.0"
+
+DIRTY_UCI=0
+COMMITTED=0
+NET_DIRTY=0
+WIFI_DIRTY=0
+FW_DIRTY=0
+MWAN_DIRTY=0
+ERR=""
+NEW_ID=""
+RADIO_PICK=""
+MEMBER_PICK=""
+BR_NAME=""
+BR_INDEX=""
+POLICY_MEMBERS=""
+RELOAD_WARN=""
+
+on_exit() {
+	if [ "$COMMITTED" != "1" ] && [ "$DIRTY_UCI" = "1" ]; then
+		uci revert balancer >/dev/null 2>&1 || true
+		uci revert network >/dev/null 2>&1 || true
+		uci revert wireless >/dev/null 2>&1 || true
+		uci revert firewall >/dev/null 2>&1 || true
+		uci revert mwan3 >/dev/null 2>&1 || true
+	fi
+}
+trap on_exit EXIT
+
+json_escape() {
+	# Drop control characters, then escape the two characters JSON cares about.
+	printf '%s' "$1" | tr -d '\000-\037\177' | sed -e 's/\\/\\\\/g' -e 's/"/\\"/g'
+}
+
+json_bool() {
+	if [ "$1" = "1" ] || [ "$1" = "true" ]; then
+		printf 'true'
+	else
+		printf 'false'
+	fi
+}
+
+is_true() {
+	case "$1" in
+		1|true|yes|on) return 0 ;;
+		*) return 1 ;;
+	esac
+}
+
+die() {
+	msg=$1
+	[ -n "$msg" ] || msg="Something went wrong."
+	log "error: $msg"
+	printf '{"ok":false,"error":"%s"}\n' "$(json_escape "$msg")"
+	exit 1
+}
+
+log() {
+	printf '%s %s\n' "$(date '+%Y-%m-%d %H:%M:%S')" "$*" >> /var/log/balancer.log 2>/dev/null || true
+	logger -t balancer -- "$*" 2>/dev/null || true
+	if [ -f /var/log/balancer.log ]; then
+		sz=$(wc -c < /var/log/balancer.log 2>/dev/null || echo 0)
+		if [ "$sz" -gt 262144 ]; then
+			tail -n 200 /var/log/balancer.log > /var/log/balancer.log.rot 2>/dev/null || true
+			mv /var/log/balancer.log.rot /var/log/balancer.log 2>/dev/null || true
+		fi
+	fi
+}
+
+# BusyBox flock on OpenWrt 25 has -s/-x/-n and no -w timeout, so wait in a loop.
+lock_ex() {
+	command -v flock >/dev/null 2>&1 || return 0
+	exec 9>/var/run/balancer.lock
+	n=0
+	while ! flock -n 9; do
+		n=$((n + 1))
+		if [ "$n" -gt 40 ]; then
+			die "Balancer is busy. Try again in a moment."
+		fi
+		sleep 1
+	done
+}
+
+lock_sh() {
+	command -v flock >/dev/null 2>&1 || return 0
+	exec 9>/var/run/balancer.lock
+	n=0
+	while ! flock -s -n 9; do
+		n=$((n + 1))
+		if [ "$n" -gt 15 ]; then
+			return 0
+		fi
+		sleep 1
+	done
+}
+
+uget() {
+	uci -q get "$1" 2>/dev/null || true
+}
+
+# Missing options are normal during reset. A failing delete must not abort the script.
+uci_del() {
+	uci -q delete "$1" >/dev/null 2>&1 || true
+}
+
+uci_del_list() {
+	uci -q del_list "$1" >/dev/null 2>&1 || true
+}
+
+check_pending() {
+	pending=$(uci changes 2>/dev/null | grep -E '^(network|wireless|firewall|mwan3|balancer)\.' || true)
+	if [ -n "$pending" ]; then
+		ERR="Uncommitted network changes are waiting. Save or discard them in LuCI, then try again."
+		return 1
+	fi
+	return 0
+}
+
+require_mwan3() {
+	if [ ! -x /usr/sbin/mwan3 ] && [ ! -x /etc/init.d/mwan3 ]; then
+		ERR="Install the mwan3 package first."
+		return 1
+	fi
+	return 0
+}
+
+valid_id() {
+	case "$1" in
+		[A-Za-z]*[A-Za-z0-9_]*) ;;
+		*) return 1 ;;
+	esac
+	# Reject anything case did not fully cover (hyphen, dot, empty tail).
+	case "$1" in
+		*[!A-Za-z0-9_]*) return 1 ;;
+	esac
+	if [ "${#1}" -gt 15 ]; then
+		return 1
+	fi
+	case "$1" in
+		globals|state) return 1 ;;
+	esac
+	return 0
+}
+
+valid_device() {
+	case "$1" in
+		[A-Za-z]*) ;;
+		*) return 1 ;;
+	esac
+	case "$1" in
+		*[!A-Za-z0-9._-]*) return 1 ;;
+	esac
+	if [ "${#1}" -gt 15 ]; then
+		return 1
+	fi
+	return 0
+}
+
+source_ids() {
+	uci show balancer 2>/dev/null | sed -n "s/^balancer\.\([A-Za-z0-9_]*\)=source$/\1/p"
+}
+
+sections_of() {
+	pkg=$1
+	typ=$2
+	uci show "$pkg" 2>/dev/null | sed -n "s/^${pkg}\.\([A-Za-z0-9_]*\)=${typ}$/\1/p"
+}
+
+id_free() {
+	id=$1
+	uci -q get "balancer.$id" >/dev/null 2>&1 && return 1
+	uci -q get "network.$id" >/dev/null 2>&1 && return 1
+	uci -q get "wireless.$id" >/dev/null 2>&1 && return 1
+	uci -q get "mwan3.$id" >/dev/null 2>&1 && return 1
+	return 0
+}
+
+new_id() {
+	prefix=$1
+	n=0
+	NEW_ID=""
+	while [ "$n" -lt 8 ]; do
+		hex=$(dd if=/dev/urandom bs=16 count=1 2>/dev/null | md5sum | awk '{print substr($1,1,6)}')
+		id="${prefix}${hex}"
+		if id_free "$id"; then
+			NEW_ID=$id
+			return 0
+		fi
+		n=$((n + 1))
+	done
+	ERR="Could not allocate a free name."
+	return 1
+}
+
+enabled_count() {
+	COUNT=0
+	for sid in $(source_ids); do
+		en=$(uget "balancer.$sid.enabled")
+		if [ "$en" = "1" ]; then
+			COUNT=$((COUNT + 1))
+		fi
+	done
+}
+
+wanted_net() {
+	needle=$1
+	[ -n "$needle" ] || return 1
+	for sid in $(source_ids); do
+		got=$(uget "balancer.$sid.network")
+		[ "$got" = "$needle" ] && return 0
+	done
+	return 1
+}
+
+source_uses_device() {
+	port=$1
+	for sid in $(source_ids); do
+		kind=$(uget "balancer.$sid.kind")
+		dev=$(uget "balancer.$sid.device")
+		[ "$kind" = "device" ] && [ "$dev" = "$port" ] && return 0
+	done
+	return 1
+}
+
+ensure_config() {
+	if ! uci -q get balancer.globals >/dev/null 2>&1; then
+		uci set balancer.globals='globals'
+		uci set balancer.globals.enabled='0'
+		uci set balancer.globals.base_wan='wan'
+	fi
+	if ! uci -q get balancer.state >/dev/null 2>&1; then
+		uci set balancer.state='state'
+		uci set balancer.state.applied='0'
+	fi
+}
+
+clamp_weight() {
+	w=$1
+	case "$w" in
+		''|*[!0-9]*) w=10 ;;
+	esac
+	if [ "$w" -lt 1 ]; then
+		w=1
+	fi
+	if [ "$w" -gt 100 ]; then
+		w=100
+	fi
+	WEIGHT=$w
+}
+
+metric_in_use() {
+	want=$1
+	for m in $(uci show network 2>/dev/null | sed -n "s/.*\.metric='\([0-9][0-9]*\)'/\1/p"); do
+		[ "$m" = "$want" ] && return 0
+	done
+	return 1
+}
+
+remember_metric() {
+	net=$1
+	val=$2
+	[ -n "$val" ] || val="UNSET"
+	cur=$(uget balancer.state.saved_metric)
+	for item in $cur; do
+		name=${item%%=*}
+		[ "$name" = "$net" ] && return 0
+	done
+	uci add_list "balancer.state.saved_metric=${net}=${val}"
+}
+
+assign_metric() {
+	net=$1
+	prefer=$2
+	existed=$3
+	cur=$(uget "network.$net.metric")
+	if [ "$existed" = "1" ]; then
+		remember_metric "$net" "$cur"
+	fi
+	if [ -n "$cur" ]; then
+		return 0
+	fi
+	m=$prefer
+	while metric_in_use "$m"; do
+		m=$((m + 10))
+		if [ "$m" -gt 1000 ]; then
+			ERR="Could not find a free routing metric."
+			return 1
+		fi
+	done
+	uci set "network.$net.metric=$m"
+	NET_DIRTY=1
+	return 0
+}
+
+wan_zone() {
+	zi=0
+	while uci -q get "firewall.@zone[$zi]" >/dev/null 2>&1; do
+		name=$(uget "firewall.@zone[$zi].name")
+		if [ "$name" = "wan" ]; then
+			printf '%s\n' "@zone[$zi]"
+			return 0
+		fi
+		zi=$((zi + 1))
+	done
+	return 1
+}
+
+zone_add_network() {
+	net=$1
+	case "$net" in
+		lan|loopback) return 0 ;;
+	esac
+	zone=$(wan_zone) || {
+		ERR="The firewall has no wan zone."
+		return 1
+	}
+	nets=$(uget "firewall.${zone}.network")
+	for n in $nets; do
+		[ "$n" = "$net" ] && return 0
+	done
+	uci add_list "firewall.${zone}.network=${net}"
+	FW_DIRTY=1
+	cur=$(uget balancer.state.saved_fwnet)
+	for n in $cur; do
+		[ "$n" = "$net" ] && return 0
+	done
+	uci add_list "balancer.state.saved_fwnet=${net}"
+	return 0
+}
+
+bridge_of_port() {
+	port=$1
+	BR_NAME=""
+	BR_INDEX=""
+	[ -n "$port" ] || return 1
+	dev_i=0
+	while uci -q get "network.@device[$dev_i]" >/dev/null 2>&1; do
+		typ=$(uget "network.@device[$dev_i].type")
+		if [ "$typ" = "bridge" ]; then
+			ports=$(uget "network.@device[$dev_i].ports")
+			for p in $ports; do
+				if [ "$p" = "$port" ]; then
+					BR_NAME=$(uget "network.@device[$dev_i].name")
+					BR_INDEX=$dev_i
+					return 0
+				fi
+			done
+		fi
+		dev_i=$((dev_i + 1))
+	done
+	return 1
+}
+
+detach_port() {
+	port=$1
+	bridge_of_port "$port" || return 0
+	[ -n "$BR_NAME" ] || BR_NAME="br-lan"
+	item="${BR_NAME}=${port}"
+	cur=$(uget balancer.state.saved_bridge)
+	found=0
+	for x in $cur; do
+		[ "$x" = "$item" ] && found=1
+	done
+	if [ "$found" -eq 0 ]; then
+		uci add_list "balancer.state.saved_bridge=${item}"
+	fi
+	uci_del_list "network.@device[${BR_INDEX}].ports=${port}"
+	NET_DIRTY=1
+	return 0
+}
+
+restore_one_port() {
+	br=$1
+	port=$2
+	dev_i=0
+	while uci -q get "network.@device[$dev_i]" >/dev/null 2>&1; do
+		name=$(uget "network.@device[$dev_i].name")
+		if [ "$name" = "$br" ]; then
+			ports=$(uget "network.@device[$dev_i].ports")
+			present=0
+			for p in $ports; do
+				[ "$p" = "$port" ] && present=1
+			done
+			if [ "$present" -eq 0 ]; then
+				uci add_list "network.@device[$dev_i].ports=${port}"
+				NET_DIRTY=1
+			fi
+		fi
+		dev_i=$((dev_i + 1))
+	done
+}
+
+needs_force() {
+	net=$1
+	dev=$2
+	case "$net" in
+		lan) return 0 ;;
+	esac
+	case "$dev" in
+		br-lan|lan) return 0 ;;
+	esac
+	if bridge_of_port "$dev"; then
+		return 0
+	fi
+	return 1
+}
+
+wifi_devices() {
+	sections_of wireless wifi-device
+}
+
+radio_band() {
+	r=$1
+	band=$(uget "wireless.$r.band")
+	if [ -n "$band" ]; then
+		printf '%s\n' "$band"
+		return 0
+	fi
+	hw=$(uget "wireless.$r.hwmode")
+	case "$hw" in
+		11a*|11ac*) printf '5g\n' ;;
+		11b*|11g*) printf '2g\n' ;;
+		*) printf '\n' ;;
+	esac
+}
+
+radio_disabled() {
+	d=$(uget "wireless.$1.disabled")
+	[ "$d" = "1" ]
+}
+
+sta_on_radio() {
+	radio=$1
+	except=$2
+	for sif in $(sections_of wireless wifi-iface); do
+		[ "$sif" = "$except" ] && continue
+		mode=$(uget "wireless.$sif.mode")
+		dev=$(uget "wireless.$sif.device")
+		dis=$(uget "wireless.$sif.disabled")
+		if [ "$mode" = "sta" ] && [ "$dev" = "$radio" ] && [ "$dis" != "1" ]; then
+			return 0
+		fi
+	done
+	return 1
+}
+
+pick_radio() {
+	want=$1
+	except=$2
+	RADIO_PICK=""
+	fallback=""
+	[ -n "$want" ] || want="any"
+	for r in $(wifi_devices); do
+		radio_disabled "$r" && continue
+		b=$(radio_band "$r")
+		if [ "$want" = "any" ]; then
+			if ! sta_on_radio "$r" "$except"; then
+				case "$b" in
+					5g) RADIO_PICK=$r; return 0 ;;
+					2g|6g) [ -n "$fallback" ] || fallback=$r ;;
+				esac
+			fi
+		else
+			if [ "$b" = "$want" ]; then
+				if sta_on_radio "$r" "$except"; then
+					ERR="The ${want} radio already has a Wi-Fi source. Remove it or choose another band."
+					return 1
+				fi
+				RADIO_PICK=$r
+				return 0
+			fi
+		fi
+	done
+	if [ -n "$fallback" ]; then
+		RADIO_PICK=$fallback
+		return 0
+	fi
+	ERR="No free radio is available for this band."
+	return 1
+}
+
+set_if_changed() {
+	opt=$1
+	val=$2
+	kind=$3
+	old=$(uget "$opt")
+	if [ "$old" != "$val" ]; then
+		uci set "${opt}=${val}"
+		if [ "$kind" = "WIFI" ]; then
+			WIFI_DIRTY=1
+		elif [ "$kind" = "MWAN" ]; then
+			MWAN_DIRTY=1
+		else
+			NET_DIRTY=1
+		fi
+	fi
+}
+
+ensure_managed_net() {
+	net=$1
+	enabled=$2
+	device=$3
+	existed=0
+	if uci -q get "network.$net" >/dev/null 2>&1; then
+		existed=1
+		own=$(uget "network.$net.balancer")
+		if [ "$own" != "1" ]; then
+			ERR="Network interface ${net} already exists."
+			return 1
+		fi
+	else
+		uci set "network.$net=interface"
+		uci set "network.$net.proto=dhcp"
+		uci set "network.$net.peerdns=0"
+		uci set "network.$net.ipv6=0"
+		uci set "network.$net.balancer=1"
+		NET_DIRTY=1
+	fi
+	if [ -n "$device" ]; then
+		set_if_changed "network.$net.device" "$device" NET
+	fi
+	if [ "$enabled" = "1" ]; then
+		auto=1
+	else
+		auto=0
+	fi
+	oldauto=$(uget "network.$net.auto")
+	[ -n "$oldauto" ] || oldauto=1
+	if [ "$oldauto" != "$auto" ]; then
+		uci set "network.$net.auto=$auto"
+		NET_DIRTY=1
+	fi
+	base=$(uget balancer.globals.base_wan)
+	[ -n "$base" ] || base="wan"
+	if [ "$net" = "$base" ]; then
+		prefer=10
+	else
+		prefer=20
+	fi
+	assign_metric "$net" "$prefer" "$existed" || return 1
+	return 0
+}
+
+ensure_wifi() {
+	net=$1
+	radio=$2
+	ssid=$3
+	enc=$4
+	key=$5
+	hidden=$6
+	enabled=$7
+	if uci -q get "wireless.$net" >/dev/null 2>&1; then
+		own=$(uget "wireless.$net.balancer")
+		if [ "$own" != "1" ]; then
+			ERR="A wireless section named ${net} already exists."
+			return 1
+		fi
+	else
+		uci set "wireless.$net=wifi-iface"
+		uci set "wireless.$net.mode=sta"
+		uci set "wireless.$net.network=$net"
+		uci set "wireless.$net.balancer=1"
+		WIFI_DIRTY=1
+	fi
+	set_if_changed "wireless.$net.device" "$radio" WIFI
+	set_if_changed "wireless.$net.ssid" "$ssid" WIFI
+	set_if_changed "wireless.$net.encryption" "$enc" WIFI
+	if [ "$enc" = "none" ]; then
+		if uci -q get "wireless.$net.key" >/dev/null 2>&1; then
+			uci_del "wireless.$net.key"
+			WIFI_DIRTY=1
+		fi
+	else
+		oldkey=$(uget "wireless.$net.key")
+		if [ "$oldkey" != "$key" ]; then
+			uci set "wireless.$net.key=${key}"
+			WIFI_DIRTY=1
+		fi
+	fi
+	if [ "$hidden" = "1" ]; then
+		set_if_changed "wireless.$net.hidden" "1" WIFI
+	else
+		if uci -q get "wireless.$net.hidden" >/dev/null 2>&1; then
+			uci_del "wireless.$net.hidden"
+			WIFI_DIRTY=1
+		fi
+	fi
+	if [ "$enabled" = "1" ]; then
+		dis=0
+	else
+		dis=1
+	fi
+	olddis=$(uget "wireless.$net.disabled")
+	[ -n "$olddis" ] || olddis=0
+	if [ "$olddis" != "$dis" ]; then
+		uci set "wireless.$net.disabled=$dis"
+		WIFI_DIRTY=1
+	fi
+	return 0
+}
+
+ensure_track_iface() {
+	net=$1
+	owned=$2
+	typ=$(uget "mwan3.$net")
+	if [ -z "$typ" ]; then
+		uci set "mwan3.$net=interface"
+		uci set "mwan3.$net.enabled=1"
+		uci set "mwan3.$net.family=ipv4"
+		uci set "mwan3.$net.reliability=1"
+		uci set "mwan3.$net.count=1"
+		uci set "mwan3.$net.timeout=2"
+		uci set "mwan3.$net.interval=5"
+		uci set "mwan3.$net.failure_interval=5"
+		uci set "mwan3.$net.recovery_interval=5"
+		uci set "mwan3.$net.down=3"
+		uci set "mwan3.$net.up=3"
+		uci set "mwan3.$net.initial_state=online"
+		uci add_list "mwan3.$net.track_ip=1.1.1.1"
+		uci add_list "mwan3.$net.track_ip=1.0.0.1"
+		uci add_list "mwan3.$net.track_ip=8.8.8.8"
+		uci set "mwan3.$net.balancer=1"
+		MWAN_DIRTY=1
+		return 0
+	fi
+	if [ "$typ" != "interface" ]; then
+		ERR="mwan3.${net} exists and is not an interface."
+		return 1
+	fi
+	# A stock section such as wan keeps its own track list.
+	if [ "$owned" = "1" ]; then
+		en=$(uget "mwan3.$net.enabled")
+		if [ "$en" != "1" ]; then
+			uci set "mwan3.$net.enabled=1"
+			MWAN_DIRTY=1
+		fi
+	fi
+	return 0
+}
+
+ensure_member() {
+	net=$1
+	weight=$2
+	mem="m${net}"
+	if [ "${#mem}" -gt 15 ]; then
+		hex=$(printf '%s' "$net" | md5sum | awk '{print substr($1,1,14)}')
+		mem="m${hex}"
+	fi
+	MEMBER_PICK=$mem
+	typ=$(uget "mwan3.$mem")
+	if [ -n "$typ" ]; then
+		own=$(uget "mwan3.$mem.balancer")
+		iface=$(uget "mwan3.$mem.interface")
+		if [ "$own" != "1" ]; then
+			ERR="mwan3 already has a member named ${mem}."
+			return 1
+		fi
+		if [ "$iface" != "$net" ]; then
+			ERR="Member ${mem} already points at ${iface}."
+			return 1
+		fi
+	else
+		uci set "mwan3.$mem=member"
+		uci set "mwan3.$mem.balancer=1"
+		MWAN_DIRTY=1
+	fi
+	set_if_changed "mwan3.$mem.interface" "$net" MWAN
+	set_if_changed "mwan3.$mem.metric" "1" MWAN
+	set_if_changed "mwan3.$mem.weight" "$weight" MWAN
+	return 0
+}
+
+ensure_snapshot() {
+	applied=$(uget balancer.state.applied)
+	if [ "$applied" = "1" ]; then
+		return 0
+	fi
+	if uci -q get mwan3.balanced >/dev/null 2>&1; then
+		cur=$(uget mwan3.balanced.use_member)
+	else
+		cur=""
+	fi
+	uci set "balancer.state.saved_members=${cur}"
+	uci set balancer.state.applied='1'
+	uci set balancer.globals.enabled='1'
+	log "snapshotted balanced policy"
+	return 0
+}
+
+set_policy_members() {
+	list=$1
+	typ=$(uget mwan3.balanced)
+	if [ -z "$typ" ]; then
+		uci set mwan3.balanced='policy'
+		uci set balancer.state.created_policy='1'
+		MWAN_DIRTY=1
+	elif [ "$typ" != "policy" ]; then
+		ERR="mwan3.balanced exists and is not a policy."
+		return 1
+	fi
+	old=$(uget mwan3.balanced.use_member)
+	old=$(printf '%s' "$old" | awk '{$1=$1; print}')
+	new=$(printf '%s' "$list" | awk '{$1=$1; print}')
+	if [ "$old" = "$new" ]; then
+		return 0
+	fi
+	uci_del mwan3.balanced.use_member
+	for m in $new; do
+		uci add_list "mwan3.balanced.use_member=$m"
+	done
+	MWAN_DIRTY=1
+	return 0
+}
+
+ensure_rule() {
+	if uci show mwan3 2>/dev/null | grep -q "use_policy='balanced'"; then
+		return 0
+	fi
+	uci set mwan3.balancer_v4='rule'
+	uci set mwan3.balancer_v4.dest_ip='0.0.0.0/0'
+	uci set mwan3.balancer_v4.family='ipv4'
+	uci set mwan3.balancer_v4.use_policy='balanced'
+	uci set balancer.state.created_rule='1'
+	MWAN_DIRTY=1
+	return 0
+}
+
+provision_source() {
+	s=$1
+	kind=$(uget "balancer.$s.kind")
+	net=$(uget "balancer.$s.network")
+	device=$(uget "balancer.$s.device")
+	ssid=$(uget "balancer.$s.ssid")
+	enc=$(uget "balancer.$s.encryption")
+	key=$(uget "balancer.$s.key")
+	band=$(uget "balancer.$s.band")
+	hidden=$(uget "balancer.$s.hidden")
+	force=$(uget "balancer.$s.force_lan")
+	enabled=$(uget "balancer.$s.enabled")
+	[ "$enabled" = "1" ] || enabled=0
+	[ "$hidden" = "1" ] || hidden=0
+	[ "$force" = "1" ] || force=0
+	[ -n "$band" ] || band="any"
+	[ -n "$enc" ] || enc="psk2"
+	clamp_weight "$(uget "balancer.$s.weight")"
+
+	case "$kind" in
+		existing)
+			if ! valid_id "$net"; then
+				ERR="Interface name ${net} cannot be used."
+				return 1
+			fi
+			if ! uci -q get "network.$net" >/dev/null 2>&1; then
+				ERR="Interface ${net} is not in the network config."
+				return 1
+			fi
+			dev=$(uget "network.$net.device")
+			if needs_force "$net" "$dev"; then
+				if [ "$force" != "1" ]; then
+					ERR="Using ${net} as a WAN needs the LAN confirmation."
+					return 1
+				fi
+			fi
+			base=$(uget balancer.globals.base_wan)
+			[ -n "$base" ] || base="wan"
+			if [ "$net" = "$base" ]; then
+				prefer=10
+			else
+				prefer=20
+			fi
+			assign_metric "$net" "$prefer" 1 || return 1
+			if [ "$net" != "lan" ]; then
+				zone_add_network "$net" || return 1
+			fi
+			ensure_track_iface "$net" 0 || return 1
+			;;
+		device)
+			if ! valid_device "$device"; then
+				ERR="That port name is not valid."
+				return 1
+			fi
+			case "$device" in
+				lo|br-lan)
+					ERR="The LAN bridge stays in place. Pick a port on it, or an existing WAN."
+					return 1
+					;;
+			esac
+			if [ -d "/sys/class/net/$device/wireless" ] || [ -d "/sys/class/net/$device/phy80211" ]; then
+				ERR="That interface is a Wi-Fi radio. Use Add Wi-Fi instead."
+				return 1
+			fi
+			for nif in $(sections_of network interface); do
+				[ "$nif" = "$net" ] && continue
+				ndev=$(uget "network.$nif.device")
+				if [ -n "$ndev" ] && [ "$ndev" = "$device" ]; then
+					ERR="That port is already used by interface ${nif}. Add that interface instead."
+					return 1
+				fi
+			done
+			if bridge_of_port "$device" || [ "$device" = "lan" ]; then
+				if [ "$force" != "1" ]; then
+					ERR="Port ${device} is part of the LAN bridge. Confirm that before using it as a WAN."
+					return 1
+				fi
+				detach_port "$device" || return 1
+			fi
+			if [ -z "$net" ]; then
+				new_id b || return 1
+				net=$NEW_ID
+				uci set "balancer.$s.network=$net"
+			fi
+			if ! valid_id "$net"; then
+				ERR="Could not name the new interface."
+				return 1
+			fi
+			ensure_managed_net "$net" "$enabled" "$device" || return 1
+			zone_add_network "$net" || return 1
+			ensure_track_iface "$net" 1 || return 1
+			;;
+		wifi)
+			if [ -z "$ssid" ]; then
+				ERR="Enter the Wi-Fi name."
+				return 1
+			fi
+			if [ "${#ssid}" -gt 32 ]; then
+				ERR="That Wi-Fi name is too long."
+				return 1
+			fi
+			case "$enc" in
+				none|psk|psk2|psk-mixed|sae|sae-mixed) ;;
+				*)
+					ERR="Pick a security type."
+					return 1
+					;;
+			esac
+			if [ "$enc" != "none" ]; then
+				klen=${#key}
+				if [ "$klen" -lt 8 ] || [ "$klen" -gt 64 ]; then
+					ERR="This network needs a password of 8 to 64 characters."
+					return 1
+				fi
+			fi
+			if [ -z "$net" ]; then
+				new_id b || return 1
+				net=$NEW_ID
+				uci set "balancer.$s.network=$net"
+			fi
+			pick_radio "$band" "$net" || return 1
+			uci set "balancer.$s.radio=$RADIO_PICK"
+			ensure_managed_net "$net" "$enabled" "" || return 1
+			ensure_wifi "$net" "$RADIO_PICK" "$ssid" "$enc" "$key" "$hidden" "$enabled" || return 1
+			zone_add_network "$net" || return 1
+			ensure_track_iface "$net" 1 || return 1
+			;;
+		*)
+			ERR="Unknown source type."
+			return 1
+			;;
+	esac
+
+	if [ "$enabled" = "1" ]; then
+		ensure_member "$net" "$WEIGHT" || return 1
+		POLICY_MEMBERS="${POLICY_MEMBERS} ${MEMBER_PICK}"
+	fi
+	return 0
+}
+
+cleanup_orphans() {
+	for net in $(sections_of network interface); do
+		own=$(uget "network.$net.balancer")
+		[ "$own" = "1" ] || continue
+		if ! wanted_net "$net"; then
+			uci_del "network.$net"
+			NET_DIRTY=1
+		fi
+	done
+	for sif in $(sections_of wireless wifi-iface); do
+		own=$(uget "wireless.$sif.balancer")
+		[ "$own" = "1" ] || continue
+		if ! wanted_net "$sif"; then
+			uci_del "wireless.$sif"
+			WIFI_DIRTY=1
+		fi
+	done
+	for iface in $(sections_of mwan3 interface); do
+		own=$(uget "mwan3.$iface.balancer")
+		[ "$own" = "1" ] || continue
+		if ! wanted_net "$iface"; then
+			uci_del "mwan3.$iface"
+			MWAN_DIRTY=1
+		fi
+	done
+	for mem in $(sections_of mwan3 member); do
+		own=$(uget "mwan3.$mem.balancer")
+		[ "$own" = "1" ] || continue
+		iface=$(uget "mwan3.$mem.interface")
+		if ! wanted_net "$iface"; then
+			uci_del "mwan3.$mem"
+			MWAN_DIRTY=1
+		fi
+	done
+	zone=$(wan_zone || true)
+	for net in $(uget balancer.state.saved_fwnet); do
+		if ! wanted_net "$net"; then
+			if [ -n "$zone" ]; then
+				uci_del_list "firewall.${zone}.network=${net}"
+			fi
+			uci_del_list "balancer.state.saved_fwnet=${net}"
+			FW_DIRTY=1
+		fi
+	done
+	for item in $(uget balancer.state.saved_bridge); do
+		br=${item%%=*}
+		port=${item#*=}
+		if ! source_uses_device "$port"; then
+			restore_one_port "$br" "$port"
+			uci_del_list "balancer.state.saved_bridge=${item}"
+			NET_DIRTY=1
+		fi
+	done
+}
+
+delete_all_owned() {
+	for sif in $(sections_of wireless wifi-iface); do
+		own=$(uget "wireless.$sif.balancer")
+		if [ "$own" = "1" ]; then
+			uci_del "wireless.$sif"
+			WIFI_DIRTY=1
+		fi
+	done
+	for net in $(sections_of network interface); do
+		own=$(uget "network.$net.balancer")
+		if [ "$own" = "1" ]; then
+			uci_del "network.$net"
+			NET_DIRTY=1
+		fi
+	done
+	for iface in $(sections_of mwan3 interface); do
+		own=$(uget "mwan3.$iface.balancer")
+		if [ "$own" = "1" ]; then
+			uci_del "mwan3.$iface"
+			MWAN_DIRTY=1
+		fi
+	done
+	for mem in $(sections_of mwan3 member); do
+		own=$(uget "mwan3.$mem.balancer")
+		if [ "$own" = "1" ]; then
+			uci_del "mwan3.$mem"
+			MWAN_DIRTY=1
+		fi
+	done
+}
+
+restore_bridges() {
+	for item in $(uget balancer.state.saved_bridge); do
+		br=${item%%=*}
+		port=${item#*=}
+		restore_one_port "$br" "$port"
+	done
+}
+
+restore_metrics() {
+	for item in $(uget balancer.state.saved_metric); do
+		net=${item%%=*}
+		val=${item#*=}
+		if uci -q get "network.$net" >/dev/null 2>&1; then
+			cur=$(uget "network.$net.metric")
+			if [ "$val" = "UNSET" ]; then
+				if [ -n "$cur" ]; then
+					uci_del "network.$net.metric"
+					NET_DIRTY=1
+				fi
+			else
+				if [ "$cur" != "$val" ]; then
+					uci set "network.$net.metric=$val"
+					NET_DIRTY=1
+				fi
+			fi
+		fi
+	done
+}
+
+restore_fw() {
+	zone=$(wan_zone || true)
+	[ -n "$zone" ] || return 0
+	for net in $(uget balancer.state.saved_fwnet); do
+		case "$net" in
+			wan|wan6|wwan|lan) continue ;;
+		esac
+		uci_del_list "firewall.${zone}.network=${net}"
+		FW_DIRTY=1
+	done
+}
+
+restore_policy() {
+	if [ "$(uget balancer.state.created_rule)" = "1" ]; then
+		uci_del mwan3.balancer_v4
+		MWAN_DIRTY=1
+	fi
+	if [ "$(uget balancer.state.created_policy)" = "1" ]; then
+		uci_del mwan3.balanced
+		MWAN_DIRTY=1
+		return 0
+	fi
+	if uci -q get mwan3.balanced >/dev/null 2>&1; then
+		saved=$(uget balancer.state.saved_members)
+		uci_del mwan3.balanced.use_member
+		for m in $saved; do
+			uci add_list "mwan3.balanced.use_member=$m"
+		done
+		MWAN_DIRTY=1
+	fi
+	return 0
+}
+
+clear_state() {
+	uci set balancer.state.applied='0'
+	uci set balancer.globals.enabled='0'
+	uci_del balancer.state.saved_members
+	uci_del balancer.state.saved_metric
+	uci_del balancer.state.saved_fwnet
+	uci_del balancer.state.saved_bridge
+	uci_del balancer.state.created_policy
+	uci_del balancer.state.created_rule
+}
+
+commit_all() {
+	uci commit balancer
+	uci commit network
+	uci commit wireless
+	uci commit firewall
+	uci commit mwan3
+	chmod 600 /etc/config/balancer 2>/dev/null || true
+	COMMITTED=1
+}
+
+reload_changed() {
+	RELOAD_WARN=""
+	if [ "$NET_DIRTY" = "1" ]; then
+		log "reload network"
+		if ! /etc/init.d/network reload >>/var/log/balancer.log 2>&1; then
+			RELOAD_WARN="Network reload failed."
+		fi
+		sleep 2
+	fi
+	if [ "$WIFI_DIRTY" = "1" ]; then
+		log "reload wifi"
+		if ! wifi reload >>/var/log/balancer.log 2>&1; then
+			RELOAD_WARN="${RELOAD_WARN} Wi-Fi reload failed."
+		fi
+		sleep 2
+	fi
+	if [ "$FW_DIRTY" = "1" ]; then
+		log "reload firewall"
+		if ! /etc/init.d/firewall reload >>/var/log/balancer.log 2>&1; then
+			RELOAD_WARN="${RELOAD_WARN} Firewall reload failed."
+		fi
+	fi
+	if [ "$MWAN_DIRTY" = "1" ] || [ "$NET_DIRTY" = "1" ] || [ "$WIFI_DIRTY" = "1" ]; then
+		log "restart mwan3"
+		/etc/init.d/mwan3 enable >>/var/log/balancer.log 2>&1 || true
+		if ! /etc/init.d/mwan3 restart >>/var/log/balancer.log 2>&1; then
+			RELOAD_WARN="${RELOAD_WARN} mwan3 restart failed."
+		fi
+	fi
+}
+
+apply_body() {
+	require_mwan3 || return 1
+	ensure_config
+	enabled_count
+	if [ "$COUNT" -lt 1 ]; then
+		ERR="Add at least one enabled source before applying. Reset to Default restores the original WAN."
+		return 1
+	fi
+	NET_DIRTY=0
+	WIFI_DIRTY=0
+	FW_DIRTY=0
+	MWAN_DIRTY=0
+	POLICY_MEMBERS=""
+	ensure_snapshot || return 1
+	for sid in $(source_ids); do
+		provision_source "$sid" || return 1
+	done
+	cleanup_orphans
+	set_policy_members "$POLICY_MEMBERS" || return 1
+	ensure_rule || return 1
+	commit_all
+	reload_changed
+	log "apply done wifi=${WIFI_DIRTY} net=${NET_DIRTY}"
+	ok=true
+	[ -z "$RELOAD_WARN" ] || ok=false
+	printf '{"ok":%s,"applied":true,"warning":"%s","network_reloaded":%s,"wifi_reloaded":%s}\n' \
+		"$ok" \
+		"$(json_escape "$RELOAD_WARN")" \
+		"$(json_bool "$NET_DIRTY")" \
+		"$(json_bool "$WIFI_DIRTY")"
+	return 0
+}
+
+reset_body() {
+	forget=$1
+	require_mwan3 || return 1
+	ensure_config
+	applied=$(uget balancer.state.applied)
+	NET_DIRTY=0
+	WIFI_DIRTY=0
+	FW_DIRTY=0
+	MWAN_DIRTY=0
+	delete_all_owned
+	restore_bridges
+	restore_metrics
+	restore_fw
+	if [ "$applied" = "1" ]; then
+		restore_policy || return 1
+	fi
+	if [ "$forget" = "1" ]; then
+		for sid in $(source_ids); do
+			uci_del "balancer.$sid"
+		done
+	fi
+	clear_state
+	commit_all
+	reload_changed
+	log "reset forget=${forget}"
+	ok=true
+	[ -z "$RELOAD_WARN" ] || ok=false
+	printf '{"ok":%s,"applied":false,"forgot":%s,"warning":"%s"}\n' \
+		"$ok" \
+		"$(json_bool "$forget")" \
+		"$(json_escape "$RELOAD_WARN")"
+	return 0
+}
+
+read_iface_state() {
+	iface=$1
+	UP=false
+	ADDR=""
+	UPTIME=0
+	TRACK=unknown
+	ONLINE=0
+	[ -n "$iface" ] || return 0
+	raw=$(ifstatus "$iface" 2>/dev/null || true)
+	if [ -n "$raw" ]; then
+		u=$(printf '%s' "$raw" | jsonfilter -e '@.up' 2>/dev/null || true)
+		[ "$u" = "true" ] && UP=true
+		ADDR=$(printf '%s' "$raw" | jsonfilter -e '@["ipv4-address"][0].address' 2>/dev/null || true)
+		UPTIME=$(printf '%s' "$raw" | jsonfilter -e '@.uptime' 2>/dev/null || true)
+	fi
+	case "$UPTIME" in
+		''|*[!0-9]*) UPTIME=0 ;;
+	esac
+	if [ -r "/var/run/mwan3track/$iface/STATUS" ]; then
+		TRACK=$(tr -cd 'a-z' < "/var/run/mwan3track/$iface/STATUS" 2>/dev/null || true)
+	fi
+	case "$TRACK" in
+		online|offline|connecting|disconnecting|disabled|paused|active|down) ;;
+		*) TRACK=unknown ;;
+	esac
+	if [ "$TRACK" = "online" ]; then
+		ONLINE=1
+	elif [ "$TRACK" = "offline" ] || [ "$TRACK" = "down" ]; then
+		ONLINE=0
+	elif [ "$UP" = "true" ] && [ -n "$ADDR" ]; then
+		ONLINE=1
+		[ "$TRACK" = "unknown" ] && TRACK=pending
+	else
+		ONLINE=0
+	fi
+}
+
+cmd_status() {
+	lock_sh
+	applied=$(uget balancer.state.applied)
+	[ "$applied" = "1" ] && applied=1 || applied=0
+	base=$(uget balancer.globals.base_wan)
+	[ -n "$base" ] || base="wan"
+	mwan3_ok=0
+	if [ -x /usr/sbin/mwan3 ] || [ -x /etc/init.d/mwan3 ]; then
+		mwan3_ok=1
+	fi
+
+	SUMW=0
+	BASE_INCLUDED=0
+	for sid in $(source_ids); do
+		en=$(uget "balancer.$sid.enabled")
+		if [ "$en" = "1" ]; then
+			clamp_weight "$(uget "balancer.$sid.weight")"
+			SUMW=$((SUMW + WEIGHT))
+			net=$(uget "balancer.$sid.network")
+			[ "$net" = "$base" ] && BASE_INCLUDED=1
+		fi
+	done
+	[ "$SUMW" -gt 0 ] || SUMW=1
+
+	printf '{'
+	printf '"ok":true,"version":"%s","applied":%s,"base_wan":"%s","base_included":%s,"mwan3":%s,' \
+		"$VERSION" \
+		"$(json_bool "$applied")" \
+		"$(json_escape "$base")" \
+		"$(json_bool "$BASE_INCLUDED")" \
+		"$(json_bool "$mwan3_ok")"
+
+	printf '"sources":['
+	first=1
+	for sid in $(source_ids); do
+		kind=$(uget "balancer.$sid.kind")
+		net=$(uget "balancer.$sid.network")
+		label=$(uget "balancer.$sid.label")
+		device=$(uget "balancer.$sid.device")
+		ssid=$(uget "balancer.$sid.ssid")
+		enc=$(uget "balancer.$sid.encryption")
+		band=$(uget "balancer.$sid.band")
+		radio=$(uget "balancer.$sid.radio")
+		hidden=$(uget "balancer.$sid.hidden")
+		force=$(uget "balancer.$sid.force_lan")
+		en=$(uget "balancer.$sid.enabled")
+		key=$(uget "balancer.$sid.key")
+		[ "$en" = "1" ] && en=1 || en=0
+		[ "$hidden" = "1" ] && hidden=1 || hidden=0
+		[ "$force" = "1" ] && force=1 || force=0
+		clamp_weight "$(uget "balancer.$sid.weight")"
+		if [ "$en" = "1" ]; then
+			pct=$((WEIGHT * 100 / SUMW))
+		else
+			pct=0
+		fi
+		[ -n "$label" ] || label=$ssid
+		[ -n "$label" ] || label=$net
+		[ -n "$label" ] || label=$device
+		[ -n "$label" ] || label=$sid
+		if [ "$kind" = "existing" ] && [ -z "$device" ]; then
+			device=$(uget "network.$net.device")
+		fi
+		has_key=0
+		[ -n "$key" ] && has_key=1
+		read_iface_state "$net"
+		[ "$first" -eq 1 ] || printf ','
+		first=0
+		printf '{"id":"%s","label":"%s","kind":"%s","network":"%s","device":"%s","ssid":"%s","encryption":"%s","band":"%s","radio":"%s","weight":%s,"percent":%s,"enabled":%s,"hidden":%s,"force_lan":%s,"has_key":%s,"online":%s,"track":"%s","uptime":%s,"address":"%s"}' \
+			"$(json_escape "$sid")" \
+			"$(json_escape "$label")" \
+			"$(json_escape "$kind")" \
+			"$(json_escape "$net")" \
+			"$(json_escape "$device")" \
+			"$(json_escape "$ssid")" \
+			"$(json_escape "$enc")" \
+			"$(json_escape "$band")" \
+			"$(json_escape "$radio")" \
+			"$WEIGHT" \
+			"$pct" \
+			"$(json_bool "$en")" \
+			"$(json_bool "$hidden")" \
+			"$(json_bool "$force")" \
+			"$(json_bool "$has_key")" \
+			"$(json_bool "$ONLINE")" \
+			"$(json_escape "$TRACK")" \
+			"$UPTIME" \
+			"$(json_escape "$ADDR")"
+	done
+	printf '],'
+
+	printf '"live":['
+	first=1
+	for mem in $(uget mwan3.balanced.use_member); do
+		iface=$(uget "mwan3.$mem.interface")
+		# Stock templates list disabled backups. Show links that are actually on.
+		if [ "$(uget "mwan3.$iface.enabled")" = "0" ]; then
+			continue
+		fi
+		wt=$(uget "mwan3.$mem.weight")
+		case "$wt" in
+			''|*[!0-9]*) wt=1 ;;
+		esac
+		mt=$(uget "mwan3.$mem.metric")
+		case "$mt" in
+			''|*[!0-9]*) mt=1 ;;
+		esac
+		read_iface_state "$iface"
+		[ "$first" -eq 1 ] || printf ','
+		first=0
+		printf '{"member":"%s","network":"%s","weight":%s,"metric":%s,"online":%s,"track":"%s","address":"%s"}' \
+			"$(json_escape "$mem")" \
+			"$(json_escape "$iface")" \
+			"$wt" "$mt" \
+			"$(json_bool "$ONLINE")" \
+			"$(json_escape "$TRACK")" \
+			"$(json_escape "$ADDR")"
+	done
+	printf '],'
+
+	printf '"radios":['
+	first=1
+	for r in $(wifi_devices); do
+		b=$(radio_band "$r")
+		dis=0
+		radio_disabled "$r" && dis=1
+		[ "$first" -eq 1 ] || printf ','
+		first=0
+		printf '{"name":"%s","band":"%s","disabled":%s}' \
+			"$(json_escape "$r")" \
+			"$(json_escape "$b")" \
+			"$(json_bool "$dis")"
+	done
+	printf '],'
+
+	printf '"candidates":['
+	first=1
+	for n in $(sections_of network interface); do
+		[ "$n" = "loopback" ] && continue
+		proto=$(uget "network.$n.proto")
+		dev=$(uget "network.$n.device")
+		warn=""
+		if [ "$n" = "lan" ] || [ "$dev" = "br-lan" ]; then
+			warn="lan"
+		fi
+		[ "$first" -eq 1 ] || printf ','
+		first=0
+		printf '{"group":"network","name":"%s","device":"%s","proto":"%s","warning":"%s"}' \
+			"$(json_escape "$n")" \
+			"$(json_escape "$dev")" \
+			"$(json_escape "$proto")" \
+			"$(json_escape "$warn")"
+	done
+	for path in /sys/class/net/*; do
+		[ -e "$path" ] || continue
+		name=${path##*/}
+		[ "$name" = "lo" ] && continue
+		if [ -d "$path/wireless" ] || [ -d "$path/phy80211" ]; then
+			continue
+		fi
+		warn=""
+		if [ "$name" = "br-lan" ] || [ "$name" = "lan" ]; then
+			warn="lan"
+		elif [ -d "/sys/class/net/br-lan/brif/$name" ]; then
+			warn="bridge-port"
+		elif [ "$name" = "eth0" ]; then
+			warn="cpu"
+		fi
+		[ "$first" -eq 1 ] || printf ','
+		first=0
+		printf '{"group":"port","name":"%s","device":"%s","proto":"","warning":"%s"}' \
+			"$(json_escape "$name")" \
+			"$(json_escape "$name")" \
+			"$(json_escape "$warn")"
+	done
+	printf ']}\n'
+}
+
+cmd_log() {
+	lock_sh
+	printf '{"ok":true,"lines":['
+	first=1
+	if [ -f /var/log/balancer.log ]; then
+		tail -n 80 /var/log/balancer.log | while IFS= read -r line; do
+			[ -n "$line" ] || continue
+			if [ "$first" -eq 1 ]; then
+				first=0
+			else
+				printf ','
+			fi
+			printf '"%s"' "$(json_escape "$line")"
+		done
+	fi
+	printf ']}\n'
+}
+
+map_enc() {
+	text=$1
+	case "$text" in
+		*WPA3*WPA2*|*WPA2*WPA3*) printf 'sae-mixed' ;;
+		*WPA3*) printf 'sae' ;;
+		*mixed*) printf 'psk-mixed' ;;
+		*WPA2*) printf 'psk2' ;;
+		*WPA*) printf 'psk' ;;
+		*none*|*None*) printf 'none' ;;
+		*) printf 'psk2' ;;
+	esac
+}
+
+cmd_scan() {
+	band=$1
+	[ -n "$band" ] || band="any"
+	case "$band" in
+		any|2g|5g|6g) ;;
+		*) die "Pick a band." ;;
+	esac
+	command -v iwinfo >/dev/null 2>&1 || die "iwinfo is not installed."
+	raw=$(mktemp /tmp/balancer-scan.XXXXXX)
+	cells=$(mktemp /tmp/balancer-cells.XXXXXX)
+	for r in $(wifi_devices); do
+		radio_disabled "$r" && continue
+		b=$(radio_band "$r")
+		if [ "$band" != "any" ] && [ "$b" != "$band" ]; then
+			continue
+		fi
+		ifname=$(ubus call network.wireless status 2>/dev/null | jsonfilter -e "@.${r}.interfaces[0].ifname" 2>/dev/null || true)
+		[ -n "$ifname" ] || ifname=$r
+		log "scan ${r}"
+		iwinfo "$ifname" scan > "$raw" 2>/dev/null || true
+		awk '
+			function flush() {
+				if (ssid != "" && ssid != "unknown") {
+					gsub(/\t/, " ", ssid)
+					gsub(/\t/, " ", enc)
+					printf "%s\t%s\t%s\t%s\t%s\n", ssid, band, signal, enc, channel
+				}
+				ssid = ""; signal = ""; enc = ""; channel = ""
+			}
+			BEGIN { band = "'"$b"'"; signal = "0" }
+			/^Cell / { flush(); next }
+			/ESSID:/ {
+				line = $0
+				sub(/.*ESSID: /, "", line)
+				gsub(/^"|"$/, "", line)
+				ssid = line
+			}
+			/Signal:/ { signal = $2; gsub(/[^0-9-]/, "", signal) }
+			/Encryption:/ {
+				line = $0
+				sub(/.*Encryption: /, "", line)
+				enc = line
+			}
+			/Channel:/ {
+				if (channel == "") {
+					for (i = 1; i <= NF; i++) if ($i == "Channel:") channel = $(i + 1)
+					gsub(/[^0-9]/, "", channel)
+				}
+			}
+			/Frequency:/ {
+				freq = $2 + 0
+				if (freq > 0 && freq < 3) band = "2g"
+				else if (freq >= 3 && freq < 5.9) band = "5g"
+				else if (freq >= 5.9) band = "6g"
+			}
+			END { flush() }
+		' "$raw" >> "$cells"
+	done
+	# Keep the strongest signal for each SSID and band.
+	dedup=$(mktemp /tmp/balancer-dedup.XXXXXX)
+	awk -F '\t' '
+		{
+			key = $1 "\t" $2
+			sig = $3 + 0
+			if (!(key in best) || sig > best[key]) {
+				best[key] = sig
+				row[key] = $0
+			}
+		}
+		END {
+			for (k in row) print row[k]
+		}
+	' "$cells" | sort -t "$(printf '\t')" -k3,3nr | head -n 30 > "$dedup"
+
+	printf '{"ok":true,"cells":['
+	first=1
+	while IFS="$(printf '\t')" read -r ssid cband signal enc channel; do
+		[ -n "$ssid" ] || continue
+		mapped=$(map_enc "$enc")
+		case "$signal" in
+			''|*[!0-9-]*) signal=0 ;;
+		esac
+		case "$channel" in
+			''|*[!0-9]*) channel=0 ;;
+		esac
+		[ "$first" -eq 1 ] || printf ','
+		first=0
+		printf '{"ssid":"%s","band":"%s","signal":%s,"encryption":"%s","channel":%s}' \
+			"$(json_escape "$ssid")" \
+			"$(json_escape "$cband")" \
+			"$signal" \
+			"$(json_escape "$mapped")" \
+			"$channel"
+	done < "$dedup"
+	printf ']}\n'
+	rm -f "$raw" "$cells" "$dedup"
+}
+
+accept_input_file() {
+	file=$1
+	case "$file" in
+		*[!A-Za-z0-9/_.-]*) die "Bad input path." ;;
+		*..*) die "Bad input path." ;;
+		/tmp/balancer-rpc.json) ;;
+		/tmp/balancer-rpc-[0-9]*) ;;
+		*) die "Bad input path." ;;
+	esac
+	[ -f "$file" ] || die "Missing input."
+	sz=$(wc -c < "$file" 2>/dev/null || echo 0)
+	if [ "$sz" -gt 16384 ]; then
+		rm -f "$file"
+		die "That request is too large."
+	fi
+}
+
+no_controls() {
+	val=$1
+	stripped=$(printf '%s' "$val" | tr -d '\000-\037\177')
+	[ "$stripped" = "$val" ]
+}
+
+cmd_save() {
+	file=$1
+	lock_ex
+	check_pending || die "$ERR"
+	accept_input_file "$file"
+	JSON=$(cat "$file")
+	rm -f "$file"
+	command -v jsonfilter >/dev/null 2>&1 || die "jsonfilter is not installed."
+	DIRTY_UCI=1
+	ensure_config
+
+	jget() {
+		jsonfilter -s "$JSON" -e "$1" 2>/dev/null || true
+	}
+
+	id=$(jget '@.id')
+	kind=$(jget '@.kind')
+	label=$(jget '@.label')
+	device=$(jget '@.device')
+	network=$(jget '@.network')
+	ssid=$(jget '@.ssid')
+	enc=$(jget '@.encryption')
+	key=$(jget '@.key')
+	band=$(jget '@.band')
+	weight=$(jget '@.weight')
+	en_raw=$(jget '@.enabled')
+	hid_raw=$(jget '@.hidden')
+	force_raw=$(jget '@.force_lan')
+	apply_raw=$(jget '@.apply')
+
+	case "$kind" in
+		existing|wifi|device) ;;
+		*) die "Pick a Wi-Fi network or a port." ;;
+	esac
+	[ -n "$enc" ] || enc="psk2"
+	case "$enc" in
+		none|psk|psk2|psk-mixed|sae|sae-mixed) ;;
+		*) die "Pick a security type." ;;
+	esac
+	[ -n "$band" ] || band="any"
+	case "$band" in
+		any|2g|5g|6g) ;;
+		*) die "Pick a band." ;;
+	esac
+	if [ -z "$en_raw" ] || is_true "$en_raw"; then
+		enabled=1
+	else
+		enabled=0
+	fi
+	if is_true "$hid_raw"; then hidden=1; else hidden=0; fi
+	if is_true "$force_raw"; then force=1; else force=0; fi
+	clamp_weight "$weight"
+	no_controls "$label" || die "The label contains control characters."
+	no_controls "$ssid" || die "The Wi-Fi name contains control characters."
+	no_controls "$key" || die "The password contains control characters."
+	if [ "${#label}" -gt 40 ]; then
+		label=$(printf '%s' "$label" | cut -c1-40)
+	fi
+
+	if [ -z "$id" ]; then
+		new_id s || die "$ERR"
+		sid=$NEW_ID
+		oldkind=""
+		oldnet=""
+		oldkey=""
+	else
+		valid_id "$id" || die "That source name is not valid."
+		sid=$id
+		if ! uci -q get "balancer.$sid" >/dev/null 2>&1; then
+			die "That source is no longer here."
+		fi
+		oldkind=$(uget "balancer.$sid.kind")
+		oldnet=$(uget "balancer.$sid.network")
+		oldkey=$(uget "balancer.$sid.key")
+		if [ -n "$oldkind" ] && [ "$oldkind" != "$kind" ]; then
+			die "Remove this source and add it again as a different type."
+		fi
+	fi
+
+	case "$kind" in
+		existing)
+			valid_id "$network" || die "Pick an interface."
+			uci -q get "network.$network" >/dev/null 2>&1 || die "That interface is not configured."
+			# One interface, one source.
+			for other in $(source_ids); do
+				[ "$other" = "$sid" ] && continue
+				okind=$(uget "balancer.$other.kind")
+				onet=$(uget "balancer.$other.network")
+				if [ "$okind" = "existing" ] && [ "$onet" = "$network" ]; then
+					die "That interface is already a source."
+				fi
+			done
+			net=$network
+			;;
+		device)
+			valid_device "$device" || die "Pick a port."
+			case "$device" in
+				lo|br-lan) die "The LAN bridge stays in place. Pick a port, or an existing WAN." ;;
+			esac
+			if [ -d "/sys/class/net/$device/wireless" ] || [ -d "/sys/class/net/$device/phy80211" ]; then
+				die "That interface is a Wi-Fi radio. Use Add Wi-Fi instead."
+			fi
+			for nif in $(sections_of network interface); do
+				[ "$nif" = "$oldnet" ] && continue
+				ndev=$(uget "network.$nif.device")
+				if [ -n "$ndev" ] && [ "$ndev" = "$device" ]; then
+					die "That port is already used by interface ${nif}. Add that interface instead."
+				fi
+			done
+			for other in $(source_ids); do
+				[ "$other" = "$sid" ] && continue
+				odev=$(uget "balancer.$other.device")
+				okind=$(uget "balancer.$other.kind")
+				if [ "$okind" = "device" ] && [ "$odev" = "$device" ]; then
+					die "That port is already a source."
+				fi
+			done
+			net=$oldnet
+			;;
+		wifi)
+			if [ -z "$ssid" ]; then
+				die "Enter the Wi-Fi name."
+			fi
+			if [ "${#ssid}" -gt 32 ]; then
+				die "That Wi-Fi name is too long."
+			fi
+			if [ -z "$key" ]; then
+				key=$oldkey
+			fi
+			if [ "$enc" != "none" ]; then
+				klen=${#key}
+				if [ "$klen" -lt 8 ] || [ "$klen" -gt 64 ]; then
+					die "This network needs a password of 8 to 64 characters."
+				fi
+			else
+				key=""
+			fi
+			net=$oldnet
+			;;
+	esac
+
+	[ -n "$label" ] || {
+		label=$ssid
+		[ -n "$label" ] || label=$network
+		[ -n "$label" ] || label=$device
+	}
+
+	uci set "balancer.$sid=source"
+	uci set "balancer.$sid.kind=$kind"
+	uci set "balancer.$sid.label=${label}"
+	uci set "balancer.$sid.weight=$WEIGHT"
+	uci set "balancer.$sid.enabled=$enabled"
+	uci set "balancer.$sid.hidden=$hidden"
+	uci set "balancer.$sid.force_lan=$force"
+	uci set "balancer.$sid.band=$band"
+	uci set "balancer.$sid.encryption=$enc"
+	if [ -n "$net" ]; then
+		uci set "balancer.$sid.network=$net"
+	fi
+	if [ "$kind" = "device" ] || [ "$kind" = "existing" ]; then
+		uci set "balancer.$sid.device=${device}"
+	fi
+	if [ "$kind" = "wifi" ]; then
+		uci set "balancer.$sid.ssid=${ssid}"
+		if [ "$enc" = "none" ]; then
+			uci_del "balancer.$sid.key"
+		elif [ -n "$key" ]; then
+			uci set "balancer.$sid.key=${key}"
+		fi
+	fi
+
+	if is_true "$apply_raw"; then
+		apply_body || die "$ERR"
+		return 0
+	fi
+	commit_all
+	log "saved ${sid} ${kind}"
+	printf '{"ok":true,"id":"%s","applied":%s}\n' "$(json_escape "$sid")" "$(json_bool "$(uget balancer.state.applied)")"
+}
+
+cmd_remove() {
+	sid=$1
+	lock_ex
+	check_pending || die "$ERR"
+	valid_id "$sid" || die "That source name is not valid."
+	uci -q get "balancer.$sid" >/dev/null 2>&1 || die "That source is no longer here."
+	DIRTY_UCI=1
+	applied=$(uget balancer.state.applied)
+	en=$(uget "balancer.$sid.enabled")
+	if [ "$applied" = "1" ] && [ "$en" = "1" ]; then
+		enabled_count
+		if [ "$COUNT" -le 1 ]; then
+			die "Keep at least one source enabled, or use Reset to Default."
+		fi
+	fi
+	uci_del "balancer.$sid"
+	if [ "$applied" = "1" ]; then
+		apply_body || die "$ERR"
+		return 0
+	fi
+	# Not applied: drop a half-created runtime object if one exists.
+	NET_DIRTY=0
+	WIFI_DIRTY=0
+	FW_DIRTY=0
+	MWAN_DIRTY=0
+	cleanup_orphans
+	commit_all
+	reload_changed
+	log "removed ${sid}"
+	printf '{"ok":true,"applied":false,"warning":"%s"}\n' "$(json_escape "$RELOAD_WARN")"
+}
+
+cmd_weight() {
+	sid=$1
+	raw=$2
+	lock_ex
+	check_pending || die "$ERR"
+	valid_id "$sid" || die "That source name is not valid."
+	uci -q get "balancer.$sid" >/dev/null 2>&1 || die "That source is no longer here."
+	clamp_weight "$raw"
+	DIRTY_UCI=1
+	uci set "balancer.$sid.weight=$WEIGHT"
+	if [ "$(uget balancer.state.applied)" = "1" ] && [ "$(uget "balancer.$sid.enabled")" = "1" ]; then
+		net=$(uget "balancer.$sid.network")
+		if [ -n "$net" ]; then
+			ensure_member "$net" "$WEIGHT" || die "$ERR"
+		fi
+		commit_all
+		log "weight ${sid} ${WEIGHT}"
+		if ! /etc/init.d/mwan3 restart >>/var/log/balancer.log 2>&1; then
+			printf '{"ok":false,"error":"%s","id":"%s","weight":%s}\n' \
+				"$(json_escape "The weight was saved, but mwan3 did not restart.")" \
+				"$(json_escape "$sid")" \
+				"$WEIGHT"
+			return 0
+		fi
+	else
+		commit_all
+		log "weight ${sid} ${WEIGHT}"
+	fi
+	printf '{"ok":true,"id":"%s","weight":%s}\n' "$(json_escape "$sid")" "$WEIGHT"
+}
+
+cmd_enable() {
+	sid=$1
+	raw=$2
+	lock_ex
+	check_pending || die "$ERR"
+	valid_id "$sid" || die "That source name is not valid."
+	uci -q get "balancer.$sid" >/dev/null 2>&1 || die "That source is no longer here."
+	if is_true "$raw"; then
+		val=1
+	else
+		val=0
+	fi
+	DIRTY_UCI=1
+	if [ "$val" != "1" ] && [ "$(uget balancer.state.applied)" = "1" ] && [ "$(uget "balancer.$sid.enabled")" = "1" ]; then
+		enabled_count
+		if [ "$COUNT" -le 1 ]; then
+			die "Keep at least one source enabled, or use Reset to Default."
+		fi
+	fi
+	uci set "balancer.$sid.enabled=$val"
+	if [ "$(uget balancer.state.applied)" = "1" ]; then
+		apply_body || die "$ERR"
+		return 0
+	fi
+	commit_all
+	log "enable ${sid} ${val}"
+	printf '{"ok":true,"id":"%s","enabled":%s,"applied":false}\n' "$(json_escape "$sid")" "$(json_bool "$val")"
+}
+
+cmd_apply() {
+	lock_ex
+	check_pending || die "$ERR"
+	DIRTY_UCI=1
+	apply_body || die "$ERR"
+}
+
+cmd_reset() {
+	forget=0
+	is_true "$1" && forget=1
+	lock_ex
+	check_pending || die "$ERR"
+	DIRTY_UCI=1
+	reset_body "$forget" || die "$ERR"
+}
+
+cmd_selfcheck() {
+	sample='say "hi" \ path'
+	esc=$(json_escape "$sample")
+	printf '{"ok":true,"version":"%s","escaped":"%s","flock":%s,"jsonfilter":%s,"uci":%s}\n' \
+		"$VERSION" \
+		"$esc" \
+		"$(command -v flock >/dev/null 2>&1 && json_bool 1 || json_bool 0)" \
+		"$(command -v jsonfilter >/dev/null 2>&1 && json_bool 1 || json_bool 0)" \
+		"$(command -v uci >/dev/null 2>&1 && json_bool 1 || json_bool 0)"
+}
+
+cmd=${1:-status}
+shift || true
+case "$cmd" in
+	status) cmd_status ;;
+	log) cmd_log ;;
+	scan) cmd_scan "$@" ;;
+	save) cmd_save "$@" ;;
+	remove) cmd_remove "$@" ;;
+	set_weight) cmd_weight "$@" ;;
+	enable) cmd_enable "$@" ;;
+	apply) cmd_apply ;;
+	reset) cmd_reset "$@" ;;
+	selfcheck) cmd_selfcheck ;;
+	version) printf '{"ok":true,"version":"%s"}\n' "$VERSION" ;;
+	*) die "Unknown command." ;;
+esac

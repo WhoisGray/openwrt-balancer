@@ -1,0 +1,18 @@
+#!/bin/sh
+# Create the Balancer config once. Later installs keep the user's sources.
+
+if ! uci -q get balancer.globals >/dev/null; then
+	touch /etc/config/balancer
+	uci set balancer.globals='globals'
+	uci set balancer.globals.enabled='0'
+	uci set balancer.globals.base_wan='wan'
+fi
+
+if ! uci -q get balancer.state >/dev/null; then
+	uci set balancer.state='state'
+	uci set balancer.state.applied='0'
+fi
+
+uci commit balancer
+chmod 600 /etc/config/balancer 2>/dev/null || true
+exit 0

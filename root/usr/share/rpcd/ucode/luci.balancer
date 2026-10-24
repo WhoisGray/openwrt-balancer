@@ -1,0 +1,147 @@
+'use strict';
+
+// rpcd plugin. Methods shell out to /usr/sbin/balancerctl and return its JSON.
+// ucode on OpenWrt exposes json() as a global; importing the json module fails.
+
+import { popen, writefile, unlink } from 'fs';
+
+let seq = 0;
+const id_re = regexp('^[A-Za-z][A-Za-z0-9_]{0,14}$');
+const band_re = regexp('^(any|2g|5g|6g)$');
+
+function parse_out(out) {
+	let text = trim(out || '');
+	if (!length(text))
+		return null;
+	try {
+		return json(text);
+	} catch (e) {
+		return null;
+	}
+}
+
+function run(args) {
+	let proc = popen('/usr/sbin/balancerctl ' + args, 'r');
+	if (!proc)
+		return { ok: false, error: 'Could not run balancerctl' };
+
+	let out = proc.read('all') || '';
+	let rc = proc.close();
+	let data = parse_out(out);
+	if (type(data) != 'object') {
+		return {
+			ok: false,
+			error: 'Unexpected balancerctl output',
+			detail: substr(out, 0, 300),
+			code: rc
+		};
+	}
+	return data;
+}
+
+function valid_id(s) {
+	return type(s) == 'string' && match(s, id_re);
+}
+
+function payload_file(payload) {
+	if (type(payload) != 'string' || length(payload) < 2 || length(payload) > 16384)
+		return null;
+	seq++;
+	let path = sprintf('/tmp/balancer-rpc-%d-%d.json', time(), seq);
+	// writefile returns a byte count. A failed write is reported by balancerctl.
+	writefile(path, payload);
+	return path;
+}
+
+function flag(value, when_true) {
+	if (when_true)
+		return (value == true || value == 1 || value == '1' || value == 'true') ? '1' : '0';
+	return (value == false || value == 0 || value == '0' || value == 'false') ? '0' : '1';
+}
+
+const methods = {
+	status: {
+		call: function() {
+			return run('status');
+		}
+	},
+
+	log: {
+		call: function() {
+			return run('log');
+		}
+	},
+
+	scan: {
+		args: { band: 'any' },
+		call: function(req) {
+			let band = (req.args && req.args.band) || 'any';
+			if (type(band) != 'string' || !match(band, band_re))
+				return { ok: false, error: 'Pick a band.' };
+			return run('scan ' + band);
+		}
+	},
+
+	save_source: {
+		args: { payload: '' },
+		call: function(req) {
+			let payload = req.args ? req.args.payload : null;
+			let path = payload_file(payload);
+			if (!path)
+				return { ok: false, error: 'Missing source details.' };
+			let res = run('save ' + path);
+			unlink(path);
+			return res;
+		}
+	},
+
+	remove_source: {
+		args: { id: '' },
+		call: function(req) {
+			let id = req.args ? req.args.id : '';
+			if (!valid_id(id))
+				return { ok: false, error: 'That source name is not valid.' };
+			return run('remove ' + id);
+		}
+	},
+
+	set_weight: {
+		args: { id: '', weight: 1 },
+		call: function(req) {
+			let id = req.args ? req.args.id : '';
+			let weight = int(req.args ? req.args.weight : 0);
+			if (!valid_id(id))
+				return { ok: false, error: 'That source name is not valid.' };
+			if (weight < 1 || weight > 100)
+				return { ok: false, error: 'Weight must be from 1 to 100.' };
+			return run(sprintf('set_weight %s %d', id, weight));
+		}
+	},
+
+	enable_source: {
+		args: { id: '', enabled: true },
+		call: function(req) {
+			let id = req.args ? req.args.id : '';
+			if (!valid_id(id))
+				return { ok: false, error: 'That source name is not valid.' };
+			let enabled = flag(req.args ? req.args.enabled : true, false);
+			return run(sprintf('enable %s %s', id, enabled));
+		}
+	},
+
+	apply: {
+		call: function() {
+			return run('apply');
+		}
+	},
+
+	reset: {
+		args: { forget: false },
+		call: function(req) {
+			let forget = flag(req.args ? req.args.forget : false, true);
+			return run('reset ' + forget);
+		}
+	}
+};
+
+return { 'luci.balancer': methods };

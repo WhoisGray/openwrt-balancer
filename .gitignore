@@ -1,0 +1,7 @@
+*.apk
+*.ipk
+*.tar.gz
+.DS_Store
+*.swp
+/tmp/
+.ucode-test/

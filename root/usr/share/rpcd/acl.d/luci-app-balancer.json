@@ -1,0 +1,15 @@
+{
+	"luci-app-balancer": {
+		"description": "Control multi-WAN load balancing",
+		"read": {
+			"ubus": {
+				"luci.balancer": [ "status", "scan", "log" ]
+			}
+		},
+		"write": {
+			"ubus": {
+				"luci.balancer": [ "save_source", "remove_source", "set_weight", "enable_source", "apply", "reset" ]
+			}
+		}
+	}
+}
