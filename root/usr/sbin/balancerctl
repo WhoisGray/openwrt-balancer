@@ -618,28 +618,44 @@ ensure_wifi() {
 	return 0
 }
 
+# count=5 reports loss as 0/20/40/60/80/100. recovery 40 and failure 50
+# leave no gap: mwan3 treats the gap as "not up" and would drop a usable WAN.
+apply_owned_track() {
+	net=$1
+	set_if_changed "mwan3.$net.enabled" "1" MWAN
+	set_if_changed "mwan3.$net.family" "ipv4" MWAN
+	set_if_changed "mwan3.$net.reliability" "1" MWAN
+	set_if_changed "mwan3.$net.count" "5" MWAN
+	set_if_changed "mwan3.$net.timeout" "1" MWAN
+	set_if_changed "mwan3.$net.interval" "5" MWAN
+	set_if_changed "mwan3.$net.failure_interval" "5" MWAN
+	set_if_changed "mwan3.$net.recovery_interval" "5" MWAN
+	set_if_changed "mwan3.$net.down" "3" MWAN
+	set_if_changed "mwan3.$net.up" "2" MWAN
+	set_if_changed "mwan3.$net.check_quality" "1" MWAN
+	set_if_changed "mwan3.$net.failure_loss" "50" MWAN
+	set_if_changed "mwan3.$net.recovery_loss" "40" MWAN
+	set_if_changed "mwan3.$net.failure_latency" "1000" MWAN
+	set_if_changed "mwan3.$net.recovery_latency" "1000" MWAN
+	if [ -z "$(uget "mwan3.$net.track_ip")" ]; then
+		uci add_list "mwan3.$net.track_ip=1.1.1.1"
+		uci add_list "mwan3.$net.track_ip=1.0.0.1"
+		uci add_list "mwan3.$net.track_ip=8.8.8.8"
+		MWAN_DIRTY=1
+	fi
+}
+
 ensure_track_iface() {
 	net=$1
 	owned=$2
 	typ=$(uget "mwan3.$net")
 	if [ -z "$typ" ]; then
 		uci set "mwan3.$net=interface"
-		uci set "mwan3.$net.enabled=1"
-		uci set "mwan3.$net.family=ipv4"
-		uci set "mwan3.$net.reliability=1"
-		uci set "mwan3.$net.count=1"
-		uci set "mwan3.$net.timeout=2"
-		uci set "mwan3.$net.interval=5"
-		uci set "mwan3.$net.failure_interval=5"
-		uci set "mwan3.$net.recovery_interval=5"
-		uci set "mwan3.$net.down=3"
-		uci set "mwan3.$net.up=3"
-		uci set "mwan3.$net.initial_state=online"
-		uci add_list "mwan3.$net.track_ip=1.1.1.1"
-		uci add_list "mwan3.$net.track_ip=1.0.0.1"
-		uci add_list "mwan3.$net.track_ip=8.8.8.8"
+		# A new WAN stays unused until tracking succeeds.
+		uci set "mwan3.$net.initial_state=offline"
 		uci set "mwan3.$net.balancer=1"
 		MWAN_DIRTY=1
+		apply_owned_track "$net"
 		return 0
 	fi
 	if [ "$typ" != "interface" ]; then
@@ -647,25 +663,27 @@ ensure_track_iface() {
 		return 1
 	fi
 	# A stock section such as wan keeps its own track list.
-	if [ "$owned" = "1" ]; then
-		en=$(uget "mwan3.$net.enabled")
-		if [ "$en" != "1" ]; then
-			uci set "mwan3.$net.enabled=1"
-			MWAN_DIRTY=1
-		fi
+	if [ "$owned" = "1" ] || [ "$(uget "mwan3.$net.balancer")" = "1" ]; then
+		apply_owned_track "$net"
 	fi
 	return 0
 }
 
-ensure_member() {
+member_name() {
 	net=$1
-	weight=$2
 	mem="m${net}"
 	if [ "${#mem}" -gt 15 ]; then
 		hex=$(printf '%s' "$net" | md5sum | awk '{print substr($1,1,14)}')
 		mem="m${hex}"
 	fi
 	MEMBER_PICK=$mem
+}
+
+ensure_member() {
+	net=$1
+	weight=$2
+	member_name "$net"
+	mem=$MEMBER_PICK
 	typ=$(uget "mwan3.$mem")
 	if [ -n "$typ" ]; then
 		own=$(uget "mwan3.$mem.balancer")
@@ -729,6 +747,24 @@ set_policy_members() {
 	done
 	MWAN_DIRTY=1
 	return 0
+}
+
+# The stock balanced policy also carries IPv6 members. Replacing the list
+# with IPv4-only members makes the IPv6 rule unreachable.
+ipv6_policy_members() {
+	current=$1
+	saved=$(uget balancer.state.saved_members)
+	out=""
+	for mem in $saved; do
+		case " $current $out " in
+			*" $mem "*) continue ;;
+		esac
+		iface=$(uget "mwan3.$mem.interface")
+		[ -n "$iface" ] || continue
+		[ "$(uget "mwan3.$iface.family")" = "ipv6" ] || continue
+		out="$out $mem"
+	done
+	printf '%s' "$out"
 }
 
 ensure_rule() {
@@ -1102,7 +1138,8 @@ apply_body() {
 		provision_source "$sid" || return 1
 	done
 	cleanup_orphans
-	set_policy_members "$POLICY_MEMBERS" || return 1
+	v6mem=$(ipv6_policy_members "$POLICY_MEMBERS")
+	set_policy_members "$POLICY_MEMBERS $v6mem" || return 1
 	ensure_rule || return 1
 	commit_all
 	reload_changed
@@ -1199,18 +1236,42 @@ cmd_status() {
 		mwan3_ok=1
 	fi
 
-	SUMW=0
+	# Live share is the weight among enabled sources that are online at the
+	# best (lowest) member metric. Offline and standby links show 0.
 	BASE_INCLUDED=0
+	BESTM=""
 	for sid in $(source_ids); do
 		en=$(uget "balancer.$sid.enabled")
-		if [ "$en" = "1" ]; then
-			clamp_weight "$(uget "balancer.$sid.weight")"
-			SUMW=$((SUMW + WEIGHT))
-			net=$(uget "balancer.$sid.network")
-			[ "$net" = "$base" ] && BASE_INCLUDED=1
+		[ "$en" = "1" ] || continue
+		net=$(uget "balancer.$sid.network")
+		[ "$net" = "$base" ] && BASE_INCLUDED=1
+		read_iface_state "$net"
+		[ "$ONLINE" = "1" ] || continue
+		member_name "$net"
+		mt=$(uget "mwan3.$MEMBER_PICK.metric")
+		case "$mt" in
+			''|*[!0-9]*) mt=1 ;;
+		esac
+		if [ -z "$BESTM" ] || [ "$mt" -lt "$BESTM" ]; then
+			BESTM=$mt
 		fi
 	done
-	[ "$SUMW" -gt 0 ] || SUMW=1
+	SUMW=0
+	for sid in $(source_ids); do
+		en=$(uget "balancer.$sid.enabled")
+		[ "$en" = "1" ] || continue
+		net=$(uget "balancer.$sid.network")
+		read_iface_state "$net"
+		[ "$ONLINE" = "1" ] || continue
+		member_name "$net"
+		mt=$(uget "mwan3.$MEMBER_PICK.metric")
+		case "$mt" in
+			''|*[!0-9]*) mt=1 ;;
+		esac
+		[ -n "$BESTM" ] && [ "$mt" = "$BESTM" ] || continue
+		clamp_weight "$(uget "balancer.$sid.weight")"
+		SUMW=$((SUMW + WEIGHT))
+	done
 
 	printf '{'
 	printf '"ok":true,"version":"%s","applied":%s,"base_wan":"%s","base_included":%s,"mwan3":%s,' \
@@ -1239,7 +1300,13 @@ cmd_status() {
 		[ "$hidden" = "1" ] && hidden=1 || hidden=0
 		[ "$force" = "1" ] && force=1 || force=0
 		clamp_weight "$(uget "balancer.$sid.weight")"
-		if [ "$en" = "1" ]; then
+		read_iface_state "$net"
+		member_name "$net"
+		mt=$(uget "mwan3.$MEMBER_PICK.metric")
+		case "$mt" in
+			''|*[!0-9]*) mt=1 ;;
+		esac
+		if [ "$en" = "1" ] && [ "$ONLINE" = "1" ] && [ -n "$BESTM" ] && [ "$mt" = "$BESTM" ] && [ "$SUMW" -gt 0 ]; then
 			pct=$((WEIGHT * 100 / SUMW))
 		else
 			pct=0
@@ -1256,7 +1323,7 @@ cmd_status() {
 		read_iface_state "$net"
 		[ "$first" -eq 1 ] || printf ','
 		first=0
-		printf '{"id":"%s","label":"%s","kind":"%s","network":"%s","device":"%s","ssid":"%s","encryption":"%s","band":"%s","radio":"%s","weight":%s,"percent":%s,"enabled":%s,"hidden":%s,"force_lan":%s,"has_key":%s,"online":%s,"track":"%s","uptime":%s,"address":"%s"}' \
+		printf '{"id":"%s","label":"%s","kind":"%s","network":"%s","device":"%s","ssid":"%s","encryption":"%s","band":"%s","radio":"%s","weight":%s,"metric":%s,"percent":%s,"enabled":%s,"hidden":%s,"force_lan":%s,"has_key":%s,"online":%s,"track":"%s","uptime":%s,"address":"%s"}' \
 			"$(json_escape "$sid")" \
 			"$(json_escape "$label")" \
 			"$(json_escape "$kind")" \
@@ -1267,6 +1334,7 @@ cmd_status() {
 			"$(json_escape "$band")" \
 			"$(json_escape "$radio")" \
 			"$WEIGHT" \
+			"$mt" \
 			"$pct" \
 			"$(json_bool "$en")" \
 			"$(json_bool "$hidden")" \

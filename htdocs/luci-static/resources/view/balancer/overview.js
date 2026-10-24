@@ -148,14 +148,28 @@ function selectEl(options, value) {
 	return node;
 }
 
+function sourceMetric(s) {
+	var m = parseInt(s.metric, 10);
+	return (isNaN(m) || m < 1) ? 1 : m;
+}
+
 function previewWeights() {
 	if (!state || !state.sources)
 		return;
+	var best = null;
+	state.sources.forEach(function(s) {
+		if (!s.enabled || !s.online)
+			return;
+		var m = sourceMetric(s);
+		if (best === null || m < best)
+			best = m;
+	});
 	var sum = 0;
 	state.sources.forEach(function(s) {
+		if (!s.enabled || !s.online || sourceMetric(s) !== best)
+			return;
 		var w = weights[s.id] != null ? weights[s.id] : (s.weight || 1);
-		if (s.enabled)
-			sum += w;
+		sum += w;
 	});
 	if (!sum)
 		sum = 1;
@@ -164,7 +178,8 @@ function previewWeights() {
 		if (!card)
 			return;
 		var w = weights[s.id] != null ? weights[s.id] : (s.weight || 1);
-		var pct = s.enabled ? Math.round(w * 100 / sum) : 0;
+		var inMix = !!(s.enabled && s.online && best !== null && sourceMetric(s) === best);
+		var pct = inMix ? Math.round(w * 100 / sum) : 0;
 		var bar = card.querySelector('.bl-bar > span');
 		var lab = card.querySelector('.bl-pct');
 		var num = card.querySelector('.bl-wnum');
@@ -731,7 +746,7 @@ return view.extend({
 			E('div', { 'class': 'bl-top' }, [
 				E('div', {}, [
 					E('h2', { 'class': 'bl-title' }, _('Balancer')),
-					E('p', { 'class': 'bl-sub' }, _('Share traffic across every internet source. Each weight is a share of the whole.')),
+					E('p', { 'class': 'bl-sub' }, _('Weights share new connections across sources that are online. Offline sources show 0%.')),
 					E('div', { 'class': 'bl-pill', 'id': 'bl-pill' }, _('Loading…'))
 				]),
 				E('div', { 'class': 'bl-actions' }, [
