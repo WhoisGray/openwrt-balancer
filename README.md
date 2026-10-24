@@ -1,8 +1,54 @@
 # openwrt-balancer
 
+English · [فارسی](README.fa.md)
+
 A LuCI app (`luci-app-balancer`) that makes multi-WAN load balancing easy to look at and easy to change. It sits on top of [mwan3](https://openwrt.org/docs/guide-user/network/wan/multiwan/mwan3). You add Wi-Fi networks and physical ports, give each one a weight, and the router shares new connections across them.
 
-The interface is a small set of cards: source, online or offline, and a weight slider. **Reset to Default** puts the original single-WAN policy back.
+The page is a small set of cards: source, online or offline, and a weight slider. **Reset to Default** puts the original single-WAN policy back.
+
+![Balancer on the Network page. Example sources: a WAN at 60 percent and a Wi-Fi uplink at 40 percent.](docs/images/dashboard.png)
+
+## Quick install on OpenWrt 25.12 LTS
+
+The file on the GitHub release is the OpenWrt **25.12** package (apk, firewall4). It is architecture-independent (`noarch`), so the same apk installs on every 25.12 target.
+
+`mwan3` has to be installed first if it is not already:
+
+```sh
+apk add mwan3
+```
+
+On the router, download the 1.0.0 release and install it:
+
+```sh
+wget -O /tmp/luci-app-balancer.apk \
+  https://github.com/WhoisGray/openwrt-balancer/releases/download/v1.0.0/luci-app-balancer-1.0.0-r1.apk
+apk add --allow-untrusted /tmp/luci-app-balancer.apk
+```
+
+Then open **Network → Balancer**:
+
+`http://<router>/cgi-bin/luci/admin/network/balancer`
+
+If the menu entry is missing, log out of LuCI and back in.
+
+Newer builds are on the [releases page](https://github.com/WhoisGray/openwrt-balancer/releases). Pick the `.apk` asset. To install whichever release is marked latest:
+
+```sh
+wget -q -O /tmp/balancer-release.json \
+  https://api.github.com/repos/WhoisGray/openwrt-balancer/releases/latest
+url=$(jsonfilter -i /tmp/balancer-release.json -e '@.assets[0].browser_download_url')
+wget -O /tmp/luci-app-balancer.apk "$url"
+apk add --allow-untrusted /tmp/luci-app-balancer.apk
+```
+
+Removing the package restores the original policy:
+
+```sh
+apk del luci-app-balancer
+```
+
+The install does not apply a balance and does not reload Wi-Fi. Nothing changes until you add a source and apply it.
 
 ## What you can do
 
@@ -18,8 +64,6 @@ The interface is a small set of cards: source, online or offline, and a weight s
 - OpenWrt 25.12 or newer (apk, firewall4)
 - `mwan3` installed and the LuCI base UI
 - `luci-app-mwan3` is useful for the advanced screens and is not required by this package
-
-The package is architecture-independent. The same files run on any 25.12 target.
 
 ## How balancing works
 
@@ -49,14 +93,18 @@ If this router is your only path to the network, add the working WAN as a source
 
 ## Using the app
 
-1. Install the package (see below) and open **Network → Balancer**.
+1. Install the package and open **Network → Balancer**.
 2. **Add Wi-Fi** for a hotspot or a second ISP, or **Add interface** for a port that already has internet.
 3. Set a weight. The card shows that weight and its percent of the total.
 4. The badge turns **Online** when the link has an IPv4 address or mwan3 tracking says it is up.
 5. Drag the slider to change a share. The slider updates immediately; mwan3 restarts once you release it. Wi-Fi is not reloaded.
 6. **Reset to Default** restores the original policy. Leave “Also forget saved sources” unticked if you want to apply the same list again later.
 
-The **Log** page shows the last lines from `/var/log/balancer.log`.
+![Add Wi-Fi. Scan fills the name, band, and security. The password stays on the router.](docs/images/add-wifi.png)
+
+The **Log** page shows the last lines from `/var/log/balancer.log`. Passwords are left out.
+
+![Log of an apply and a weight change.](docs/images/log.png)
 
 ### Command line
 
@@ -75,19 +123,15 @@ balancerctl enable s1ab2c 0
 
 `save` reads a JSON file (the UI creates it). You normally add sources from the web page.
 
-## Install on a running router
+## Copy the files without an apk
 
-You can copy the files without a full firmware build. From this repository:
+From a checkout of this repository, on a computer that can reach the router:
 
 ```sh
 ROUTER=root@192.168.1.1 sh scripts/install-live.sh
 ```
 
-The script uses `scp -O` because OpenWrt’s Dropbear has no SFTP server. It reloads `rpcd` and the LuCI menu cache. It does **not** apply a policy and it does **not** reload Wi-Fi.
-
-Then open `http://<router>/cgi-bin/luci/admin/network/balancer`.
-
-If the menu entry is missing, log out of LuCI and back in.
+The script uses `scp -O` because OpenWrt’s Dropbear has no SFTP server. It reloads `rpcd` and the LuCI menu cache. It does not apply a policy and it does not reload Wi-Fi.
 
 ## Build an apk with the OpenWrt SDK
 
@@ -116,30 +160,6 @@ OpenWrt 25.12 packages are apk files, produced by the normal image build system.
    ssh root@192.168.1.1 'apk add --allow-untrusted /tmp/luci-app-balancer-*.apk'
    ```
 
-`mwan3` has to be installed first if it is not already (`apk add mwan3`). The package depends on it.
-
-Removing it restores the original policy:
-
-```sh
-apk del luci-app-balancer
-```
-
-## Push this repository to GitHub
-
-The git history is yours to create. From the project directory:
-
-```sh
-cd /path/to/openwrt-balancer
-git init
-git add .
-git commit -m "Add luci-app-balancer for multi-WAN load balancing"
-git branch -M main
-git remote add origin https://github.com/whoisGray/openwrt-balancer.git
-git push -u origin main
-```
-
-Create the empty GitHub repository first if it does not exist (`gh repo create whoisGray/openwrt-balancer --public --source=. --remote=origin` does that and sets the remote). Push when you are ready; nothing in this tree talks to GitHub on its own.
-
 ## Files
 
 | Path | Role |
@@ -153,6 +173,8 @@ Create the empty GitHub repository first if it does not exist (`gh repo create w
 | `htdocs/.../log.js` | Log page |
 | `htdocs/.../balancer.css` | Layout and motion |
 | `root/etc/config/balancer` | Default config |
+| `docs/images/` | Pictures used in this README |
+| `README.fa.md` | This page in Persian |
 
 ## License
 
